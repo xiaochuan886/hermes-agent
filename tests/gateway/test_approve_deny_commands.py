@@ -372,6 +372,14 @@ class TestBareTextNoLongerApproves:
 class TestBlockingApprovalE2E:
     """Test the full blocking flow: agent thread blocks → user approves → agent resumes."""
 
+    @pytest.fixture(autouse=True)
+    def _isolate_tirith(self, monkeypatch):
+        """Keep approval queue tests independent of Tirith installation state."""
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda _command: {"action": "allow", "findings": [], "summary": ""},
+        )
+
     def setup_method(self):
         _clear_approval_state()
 

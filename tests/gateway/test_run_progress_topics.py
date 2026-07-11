@@ -111,6 +111,10 @@ def _make_runner(adapter):
 async def test_run_agent_progress_stays_in_originating_topic(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
 
+    # Real gateway startup loads enabled tools before progress events arrive.
+    # Register terminal metadata explicitly because this test replaces AIAgent.
+    import tools.terminal_tool  # noqa: F401
+
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
