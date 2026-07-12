@@ -99,6 +99,7 @@ class ControlPlaneClient:
         max_retries: int = 3,
         retry_base_delay: float = 0.1,
         retry_backoff_factor: float = 2.0,
+        retry_after_max: float = 60.0,
         sleep: Callable[[float], None] = time.sleep,
         logger: Optional[logging.Logger] = None,
     ) -> None:
@@ -116,6 +117,7 @@ class ControlPlaneClient:
         self._max_retries = max_retries
         self._retry_base_delay = retry_base_delay
         self._retry_backoff_factor = retry_backoff_factor
+        self._retry_after_max = retry_after_max
         self._sleep = sleep
         self._logger = logger or _LOGGER
 
@@ -134,17 +136,20 @@ class ControlPlaneClient:
         for attempt in range(self._max_retries + 1):
             try:
                 response = self._http.get(url, headers=headers, timeout=self._timeout)
-            except httpx.TimeoutException as exc:
+            except httpx.TransportError as exc:
+                # Timeouts, connection errors, protocol errors — retryable.
+                # (httpx.TimeoutException is a subclass of TransportError.)
                 last_error = exc
                 if attempt < self._max_retries:
                     self._sleep(self._backoff_delay(attempt))
                     self._logger.warning(
-                        "control plane timeout (attempt %d/%d); retrying",
-                        attempt + 1, self._max_retries + 1,
+                        "control plane transport error %s (attempt %d/%d); retrying",
+                        type(exc).__name__, attempt + 1, self._max_retries + 1,
                     )
                     continue
                 raise TransientFailureError(
-                    f"control plane timed out after {attempt + 1} attempts"
+                    f"control plane transport error after {attempt + 1} attempts: "
+                    f"{type(exc).__name__}"
                 ) from exc
 
             status = response.status_code
@@ -153,11 +158,27 @@ class ControlPlaneClient:
             if status == 304:
                 return self._handle_not_modified(response, etag)
             if status in (401, 403):
+                # Authentication/authorization failure — never retry.
                 raise AuthenticationError(f"control plane rejected credentials: {status}")
+            if status == 429:
+                # Throttled: retry only if the server asks us to (Retry-After),
+                # capped; otherwise surface immediately.
+                retry_after = self._parse_retry_after(response)
+                if retry_after is not None and attempt < self._max_retries:
+                    self._sleep(retry_after)
+                    self._logger.warning(
+                        "control plane throttled (429); retrying after %.3fs",
+                        retry_after,
+                    )
+                    continue
+                raise UnexpectedStatusError("control plane throttled (429) without retry")
             if 500 <= status < 600:
                 last_error = None
                 if attempt < self._max_retries:
-                    self._sleep(self._backoff_delay(attempt))
+                    delay = self._parse_retry_after(response)
+                    if delay is None:
+                        delay = self._backoff_delay(attempt)
+                    self._sleep(delay)
                     self._logger.warning(
                         "control plane returned %d (attempt %d/%d); retrying",
                         status, attempt + 1, self._max_retries + 1,
@@ -199,6 +220,24 @@ class ControlPlaneClient:
 
     def _backoff_delay(self, attempt: int) -> float:
         return self._retry_base_delay * (self._retry_backoff_factor ** attempt)
+
+    def _parse_retry_after(self, response: httpx.Response) -> Optional[float]:
+        """Return a capped sleep duration (seconds) from a ``Retry-After`` header.
+
+        Only the integer-seconds form is honored; an HTTP-date value (or a
+        missing header) returns ``None`` so the caller falls back to exponential
+        backoff.  The duration is capped at ``retry_after_max``.
+        """
+        value = response.headers.get("Retry-After")
+        if not value:
+            return None
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            return None
+        if seconds < 0:
+            return None
+        return min(seconds, self._retry_after_max)
 
     def _handle_ok(self, response: httpx.Response) -> SyncResult:
         etag = response.headers.get("ETag")

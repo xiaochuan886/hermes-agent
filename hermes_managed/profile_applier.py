@@ -10,57 +10,82 @@ Ownership boundary (frozen by the MVP plan, Task 6):
 Atomic update scheme
 --------------------
 
-Managed content lives in *versioned* real directories under
+Managed content lives in versioned real directories under
 ``<profile>/.managed-versions/<version_key>/``.  Two stable symlinks gate the
 active version:
 
 * ``<profile>/managed``  -> ``.managed-versions/<version_key>``
 * ``<profile>/skills/enterprise`` -> ``../managed/skills/enterprise``
 
-Because ``skills/enterprise`` resolves *through* ``managed``, a single atomic
-swap of the ``managed`` symlink publishes the whole managed layer (assignment
-metadata, policy, and enterprise skills) at once.
+Because ``skills/enterprise`` resolves *through* ``managed``, swapping the
+``managed`` symlink publishes the whole managed layer at once.
 
-Application steps:
+Single commit point
+-------------------
 
-1. Verify the assignment's manifest/policy checksums (defense in depth).
-2. Pre-flight: reject any pre-existing ``managed``, ``skills/enterprise``,
-   ``.managed-versions`` or ``skills`` entry that is a real directory where a
-   symlink is expected, or a symlink that resolves outside the profile.
-3. Decide: initial / update / idempotent / stale / conflict / rollback using
-   revision ordering.  Stale revisions are rejected; the same revision with
-   different content fails closed; a higher revision pointing at an older
-   ``versionId`` (rollback) is allowed.
-4. Build the new version in a sibling staging directory under
-   ``.managed-versions/.staging.<token>/``; write all files, fsync them and the
-   directory, then re-verify the written bytes.
-5. ``os.replace`` the staging directory into ``.managed-versions/<version_key>``
-   (atomic, same filesystem), create a temporary ``managed`` symlink, and
-   ``os.replace`` that symlink over ``managed`` (atomic publish).  If the
-   publish fails the temp symlink and the new version dir are removed and the
-   previous ``managed`` symlink — still pointing at the old version — is left
-   intact.
-6. Ensure the ``skills/enterprise`` tracking symlink exists.
-7. Remove orphaned version directories from previous publishes.
+All fallible preparation happens before the unique commit point — the
+``os.replace`` that swaps the ``managed`` symlink:
 
-Revocation writes a ``tombstone.json`` and an ``assignment.json`` with
-``revoked=true``; it never deletes personal data.
+1. acquire the cross-process apply lock (covers read → decide → materialize →
+   publish → active-state confirm);
+2. open trusted directory file descriptors (``profile``, ``.managed-versions``,
+   ``skills``) with ``O_DIRECTORY | O_NOFOLLOW`` and operate relative to them
+   so a check-then-replace (TOCTOU) of those entries cannot redirect writes;
+3. verify checksums, decide revision semantics, materialize a sibling staging
+   version dir (fsync every file + directory, re-verify the written bytes);
+4. rename staging → ``.managed-versions/<version_key>`` (fsync the versions
+   dir);
+5. prepare the ``skills/enterprise`` tracking symlink (create or reclaim it
+   atomically; fsync the skills dir);
+6. re-verify that ``.managed-versions`` and ``skills`` entries still pin the
+   same real directories the open fds refer to (defeats mid-apply replacement);
+7. **commit**: ``os.replace`` a fresh ``managed`` symlink into place (fsync the
+   profile dir).
+
+Steps 1–6 are reversible: on any failure the staging dir, the new version dir
+and (on first apply) the dangling enterprise link are removed and the previous
+``managed`` symlink is left intact.  Step 7 is atomic; if it fails the previous
+state is still active.  After the commit, only best-effort cleanup of orphaned
+version directories runs — its failure never makes a successful apply report
+failure.
+
+TOCTOU / symlink safety
+-----------------------
+
+* every managed root is opened with ``O_NOFOLLOW`` (refuses symlinks) and held
+  as a directory fd; subsequent operations are relative to that fd, so replacing
+  the directory *entry* with a symlink cannot redirect writes (the fd still pins
+  the original real directory);
+* ``.managed-versions`` and ``skills`` must be real directories in managed mode;
+* the current state is read via ``readlink(managed)`` + validation + opening the
+  version dir through the trusted ``versions_fd`` (never by following the
+  ``managed`` symlink);
+* cleanup uses ``lstat`` (no follow) on every entry, skips symlinks entirely and
+  re-confirms each entry lives under the pinned ``versions_fd`` — a symlink
+  planted in ``.managed-versions`` is never followed and its target is never
+  deleted.
+
+macOS note: ``fsync`` on a directory file descriptor returns ``EINVAL`` (not
+supported); :func:`_fsync_dir_fd` treats that as a tolerated degradation and
+only surfaces genuine errors.  File-level ``fsync`` is always honored.
 """
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import json
 import os
 import re
 import secrets
-import shutil
+import stat
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Optional
 
 from hermes_managed.contracts import (
-    ChecksumMismatchError,
     RuntimeAssignment,
     canonical_json_bytes,
     sha256_hex,
@@ -74,20 +99,26 @@ __all__ = [
     "PathTraversalError",
     "StaleRevisionError",
     "RevisionConflictError",
+    "ProfileLockTimeoutError",
+    "ProfileRollbackError",
     "ManagedState",
     "ApplyResult",
     "ProfileApplier",
 ]
 
-# A module-level alias for os.replace so tests can simulate a publish failure.
+# Module-level alias for os.replace so tests can simulate a commit failure.
 _atomic_replace = os.replace
 
 _MANAGED_LINK_NAME = "managed"
 _VERSIONS_DIR_NAME = ".managed-versions"
-_ENTERPRISE_LINK_REL = "skills/enterprise"
+_LOCK_FILE_NAME = ".apply.lock"
+_ENTERPRISE_LINK_NAME = "enterprise"
 _ENTERPRISE_LINK_TARGET = "../managed/skills/enterprise"
 
 _SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 
 
 # --- exceptions ---------------------------------------------------------------
@@ -113,6 +144,14 @@ class RevisionConflictError(ProfileStateError):
     """The assignment revision matches the current one but the content differs."""
 
 
+class ProfileLockTimeoutError(ProfileStateError):
+    """The cross-process apply lock could not be acquired in time."""
+
+
+class ProfileRollbackError(ProfileStateError):
+    """Rollback after a failed commit itself failed (state left for inspection)."""
+
+
 # --- state records ------------------------------------------------------------
 
 
@@ -129,6 +168,7 @@ class ManagedState:
     content_key: str
     revoked: bool
     revoked_at: Optional[str]
+    version_key: str
     version_dir: Path
 
 
@@ -150,51 +190,196 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _silent_unlink(path: Path) -> None:
+# --- low-level fd helpers -----------------------------------------------------
+
+
+def _open_dir_fd(path: Any, dir_fd: Optional[int] = None) -> int:
+    """Open a directory with O_DIRECTORY | O_NOFOLLOW (refuses symlinks)."""
+    return os.open(str(path), os.O_RDONLY | _DIRECTORY | _NOFOLLOW, dir_fd=dir_fd)
+
+
+def _open_dir_fd_retry(name: str, dir_fd: int, attempts: int = 12, delay: float = 0.002) -> int:
+    """Open a directory relative to ``dir_fd`` with a bounded retry.
+
+    macOS exhibits a rare kernel race where ``openat`` on a directory fd
+    concurrently creating entries transiently returns ``ENOENT`` even though
+    the entry exists.  This affects only fixed-name managed roots
+    (``.managed-versions``, ``skills``) when two processes initialize the same
+    profile at once.  Unique names (staging / version dirs) never race.  A
+    tampered symlink is detected via ``ENOTDIR``/``ELOOP`` (not retried).
+    """
+    last: Optional[FileNotFoundError] = None
+    for _ in range(attempts):
+        try:
+            return _open_dir_fd(name, dir_fd=dir_fd)
+        except FileNotFoundError as exc:
+            last = exc
+            time.sleep(delay)
+    assert last is not None
+    raise last
+
+
+def _open_lock_file(versions_fd: int) -> int:
+    """Open/create the apply lock relative to ``versions_fd`` (retry on ENOENT)."""
+    last: Optional[FileNotFoundError] = None
+    for _ in range(12):
+        try:
+            return os.open(
+                _LOCK_FILE_NAME,
+                os.O_RDWR | os.O_CREAT | _NOFOLLOW,
+                0o600,
+                dir_fd=versions_fd,
+            )
+        except FileNotFoundError as exc:
+            last = exc
+            time.sleep(0.002)
+    assert last is not None
+    raise last
+
+
+def _open_or_create_subdir(parent_fd: int, name: str) -> int:
+    """Open subdir ``name`` relative to ``parent_fd``; create it if absent."""
     try:
-        os.unlink(path)
+        return _open_dir_fd(name, dir_fd=parent_fd)
     except FileNotFoundError:
-        pass
+        try:
+            os.mkdir(name, dir_fd=parent_fd)
+            _fsync_dir_fd(parent_fd)
+        except FileExistsError:
+            pass  # another process created it concurrently
+        return _open_dir_fd_retry(name, dir_fd=parent_fd)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            # O_NOFOLLOW|O_DIRECTORY on a symlink: ELOOP (Linux) or ENOTDIR (macOS).
+            raise ProfileTamperError(f"{name} must not be a symlink") from exc
+        raise
 
 
-def _silent_rmtree(path: Path) -> None:
-    try:
-        shutil.rmtree(path)
-    except FileNotFoundError:
-        pass
+def _fsync_dir_fd(fd: int) -> None:
+    """Best-effort fsync of a directory fd.
 
-
-def _fsync_file(path: Path) -> None:
-    with open(path, "rb") as fh:
-        os.fsync(fh.fileno())
-
-
-def _fsync_dir(path: Path) -> None:
-    try:
-        fd = os.open(str(path), os.O_RDONLY)
-    except OSError:
-        return
+    macOS returns ``EINVAL`` for fsync on a directory fd (unsupported); that is
+    a tolerated degradation.  Any other error is surfaced so genuine durability
+    failures (and injected faults) are not swallowed.
+    """
     try:
         os.fsync(fd)
-    except OSError:
-        # Not all platforms/filesystems support fsync on directory file
-        # descriptors (e.g. macOS).  The file-level fsyncs already persist the
-        # contents; this is best-effort for directory entry durability.
+    except OSError as exc:
+        if exc.errno == errno.EINVAL:
+            return
+        raise
+
+
+def _fsync_file_fd(fd: int) -> None:
+    os.fsync(fd)
+
+
+def _read_fd(fd: int) -> str:
+    with os.fdopen(fd, "r", encoding="utf-8", closefd=True) as fh:
+        return fh.read()
+
+
+def _lstat_rel(name: str, dir_fd: int) -> os.stat_result:
+    return os.lstat(name, dir_fd=dir_fd)
+
+
+def _unlink_rel(name: str, dir_fd: int) -> None:
+    try:
+        os.unlink(name, dir_fd=dir_fd)
+    except FileNotFoundError:
         pass
+
+
+def _rmtree_fd(parent_fd: int, name: str) -> None:
+    """Recursively remove ``name`` (a real dir) relative to ``parent_fd``.
+
+    Never follows symlinks: each entry is ``lstat``-ed; a symlink entry is
+    unlinked (its target untouched), a dir entry is recursed into via a fresh
+    ``O_NOFOLLOW`` fd.
+    """
+    child_fd = _open_dir_fd(name, dir_fd=parent_fd)
+    try:
+        for entry in os.listdir(child_fd):
+            st = os.lstat(entry, dir_fd=child_fd)
+            if stat.S_ISLNK(st.st_mode):
+                os.unlink(entry, dir_fd=child_fd)
+            elif stat.S_ISDIR(st.st_mode):
+                _rmtree_fd(child_fd, entry)
+            else:
+                os.unlink(entry, dir_fd=child_fd)
     finally:
-        os.close(fd)
+        os.close(child_fd)
+    os.rmdir(name, dir_fd=parent_fd)
 
 
-def _write_file_atomic(path: Path, content: str) -> None:
-    """Write text to ``path`` and fsync it (parent must exist)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(content)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
-    _fsync_file(path)
+def _remove_entry(parent_fd: int, name: str) -> None:
+    """Remove one entry under ``parent_fd`` without following symlinks.
+
+    A symlink entry is unlinked (target preserved).  A regular file is unlinked.
+    A directory is recursively removed via :func:`_rmtree_fd`.
+    """
+    st = os.lstat(name, dir_fd=parent_fd)
+    if stat.S_ISLNK(st.st_mode):
+        os.unlink(name, dir_fd=parent_fd)
+    elif stat.S_ISDIR(st.st_mode):
+        _rmtree_fd(parent_fd, name)
+    else:
+        os.unlink(name, dir_fd=parent_fd)
+
+
+def _write_rel(base_fd: int, relpath: str, content: str) -> None:
+    """Write ``content`` to ``relpath`` relative to ``base_fd`` (atomic + fsync).
+
+    Intermediate directories are created as needed.  ``O_NOFOLLOW`` is used on
+    every open so a symlink trap cannot redirect the write.
+    """
+    parts = PurePosixPath(relpath).parts
+    if not parts or any(p in ("", ".", "..") for p in parts):
+        raise PathTraversalError("managed file path contains traversal segments")
+    if any("\\" in p for p in parts):
+        raise PathTraversalError("managed file path must not contain backslashes")
+
+    cur_fd = base_fd
+    opened: list[int] = []
+    try:
+        for part in parts[:-1]:
+            cur_fd = _open_or_create_subdir(cur_fd, part)
+            opened.append(cur_fd)
+        fname = parts[-1]
+        tmp = fname + ".tmp"
+        fd = os.open(
+            tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _NOFOLLOW, 0o600, dir_fd=cur_fd
+        )
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=True) as fh:
+            fh.write(content)
+            fh.flush()
+            _fsync_file_fd(fh.fileno())
+        _atomic_replace(tmp, fname, src_dir_fd=cur_fd, dst_dir_fd=cur_fd)
+        _fsync_dir_fd(cur_fd)
+    finally:
+        for fd in reversed(opened):
+            os.close(fd)
+
+
+def _read_rel(base_fd: int, relpath: str) -> str:
+    parts = PurePosixPath(relpath).parts
+    if not parts or any(p in ("", ".", "..") for p in parts):
+        raise PathTraversalError("managed file path contains traversal segments")
+    cur_fd = base_fd
+    opened: list[int] = []
+    try:
+        for part in parts[:-1]:
+            cur_fd = _open_dir_fd(part, dir_fd=cur_fd)
+            opened.append(cur_fd)
+        fd = os.open(parts[-1], os.O_RDONLY | _NOFOLLOW, dir_fd=cur_fd)
+        try:
+            with os.fdopen(fd, "r", encoding="utf-8", closefd=False) as fh:
+                return fh.read()
+        finally:
+            os.close(fd)
+    finally:
+        for fd in reversed(opened):
+            os.close(fd)
 
 
 def _is_within(path: Path, base: Path) -> bool:
@@ -211,7 +396,7 @@ def _validate_slug(slug: Any) -> str:
     return slug
 
 
-def _safe_skill_file_path(file_path: Any, base: Path) -> Path:
+def _safe_skill_file_path(file_path: Any) -> str:
     if not isinstance(file_path, str) or not file_path:
         raise PathTraversalError("enterprise skill file path is empty")
     if "\\" in file_path:
@@ -221,10 +406,52 @@ def _safe_skill_file_path(file_path: Any, base: Path) -> Path:
     parts = PurePosixPath(file_path).parts
     if any(p in ("", ".", "..") for p in parts):
         raise PathTraversalError("enterprise skill file path contains traversal segments")
-    target = base / file_path
-    if not _is_within(target, base):
-        raise PathTraversalError("enterprise skill file path escapes the skill directory")
-    return target
+    return file_path
+
+
+def _read_applied_at(profile: Path, version_key: str) -> str:
+    try:
+        record = json.loads(
+            (profile / _VERSIONS_DIR_NAME / version_key / "assignment.json").read_text()
+        )
+        return record.get("applied_at", "")
+    except (FileNotFoundError, json.JSONDecodeError):
+        return ""
+
+
+def _symlink_rel_fd(target: str, name: str, parent_fd: int, parent_path: Path) -> None:
+    """Create a symlink ``name`` -> ``target`` inside the dir pinned by ``parent_fd``.
+
+    ``os.symlink`` does not accept ``dst_dir_fd`` on macOS (and ``/dev/fd/<fd>``
+    is not traversable there), so this helper prefers the fd-relative form where
+    available (Linux) and falls back to creating via the parent *path* followed
+    by an immediate ``lstat`` relative to ``parent_fd``.  The post-create verify
+    confirms the symlink landed in the pinned directory: if the parent entry was
+    swapped to a symlink mid-apply, the ``lstat`` (fd-relative) does not find the
+    new entry and raises — fail closed.  Residual platform limit: on the macOS
+    fallback path there is a small window between path-based creation and the
+    verify where a swapped parent receives a dangling temp symlink entry (no
+    file content is written outside the profile).
+    """
+    try:
+        os.symlink(target, name, dst_dir_fd=parent_fd)
+        return
+    except TypeError:
+        pass  # macOS: dst_dir_fd unsupported
+    os.symlink(target, os.path.join(str(parent_path), name))
+    try:
+        st = os.lstat(name, dir_fd=parent_fd)
+    except FileNotFoundError as exc:
+        raise ProfileTamperError(
+            "symlink creation did not land in the pinned parent directory"
+        ) from exc
+    if not stat.S_ISLNK(st.st_mode):
+        raise ProfileTamperError("created managed entry is not a symlink")
+
+
+def canonical_json(obj: Any) -> str:
+    """Canonical JSON text for managed-layer files."""
+    return canonical_json_bytes(obj).decode("utf-8")
 
 
 # --- applier ------------------------------------------------------------------
@@ -235,6 +462,9 @@ class ProfileApplier:
 
     def __init__(self, profile_dir: Path) -> None:
         self._profile = Path(profile_dir)
+        # Test seams (not public API); default to no-ops.
+        self._after_open_hook: Optional[Callable[[], None]] = None
+        self._pre_commit_hook: Optional[Callable[[], None]] = None
 
     @property
     def profile_dir(self) -> Path:
@@ -247,69 +477,102 @@ class ProfileApplier:
         assignment: RuntimeAssignment,
         *,
         clock: Optional[Callable[[], str]] = None,
+        lock_timeout: float = 30.0,
+        lock_sleep: Callable[[float], None] = time.sleep,
     ) -> ApplyResult:
-        """Atomically apply ``assignment`` to the profile."""
-        # 1. Defense-in-depth checksum verification (parser already checked).
+        """Atomically apply ``assignment`` to the profile under an exclusive lock."""
         verify_manifest_checksum(assignment.manifest, assignment.manifest_sha256)
         verify_policy_checksum(assignment.effective_model_policy)
 
-        # 2. Pre-flight safety: refuse tampered / escaping paths before writing.
-        self._preflight_safety()
+        profile_fd, versions_fd, lock_fd = self._open_and_lock(
+            exclusive=True, timeout=lock_timeout, sleep=lock_sleep
+        )
+        skills_fd: Optional[int] = None
+        try:
+            if self._after_open_hook is not None:
+                self._after_open_hook()
 
-        # 3. Decide what to do relative to the current managed state.
-        current = self._read_current()
-        self._enforce_revision_semantics(current, assignment)
-        content_key = self._content_key(assignment)
+            skills_fd = self._open_skills_dir(profile_fd)
+            current = self._read_current(profile_fd, versions_fd)
+            self._enforce_revision_semantics(current, assignment)
+            content_key = self._content_key(assignment)
 
-        if current is not None and current.content_key == content_key:
-            # Idempotent re-apply of identical content: no-op.
+            if current is not None and current.content_key == content_key:
+                return ApplyResult(
+                    revision=assignment.revision,
+                    version_id=assignment.version_id,
+                    content_key=content_key,
+                    status="revoked" if assignment.revoked else "idempotent",
+                    revoked=assignment.revoked,
+                    managed_path=self._profile / _MANAGED_LINK_NAME,
+                    version_dir=self._profile / _VERSIONS_DIR_NAME / current.version_key,
+                    applied_at=_read_applied_at(self._profile, current.version_key),
+                )
+
+            version_key = self._version_key(assignment, content_key)
+            applied_at = (clock or _now_iso)()
+            first_apply = current is None
+            committed = False
+            staging_name: Optional[str] = None
+            try:
+                staging_name = self._materialize(
+                    versions_fd, assignment, content_key, version_key, applied_at
+                )
+                self._rename_to_version(versions_fd, staging_name, version_key)
+                staging_name = None  # consumed by the rename
+                self._prepare_enterprise_link(skills_fd)
+                self._verify_entries_unchanged(profile_fd, versions_fd, skills_fd)
+                if self._pre_commit_hook is not None:
+                    self._pre_commit_hook()
+                self._publish_managed(profile_fd, version_key)
+                committed = True
+            except BaseException:
+                # Rollback every preparatory side effect; fail closed on the
+                # commit point.  A rollback failure is surfaced explicitly.
+                rollback_error: Optional[BaseException] = None
+                try:
+                    self._rollback(
+                        profile_fd, versions_fd, skills_fd, version_key,
+                        staging_name, first_apply,
+                    )
+                except Exception as exc:
+                    rollback_error = exc
+                if rollback_error is not None:
+                    raise ProfileRollbackError(
+                        "rollback failed after a failed commit"
+                    ) from rollback_error
+                raise
+
+            # Post-commit best-effort cleanup.  Its failure must NOT fail apply.
+            try:
+                self._cleanup_old_versions(versions_fd, keep=version_key)
+            except Exception:
+                pass
+
             return ApplyResult(
                 revision=assignment.revision,
                 version_id=assignment.version_id,
                 content_key=content_key,
-                status="revoked" if assignment.revoked else "idempotent",
+                status="revoked" if assignment.revoked else (
+                    "initial" if first_apply else "updated"
+                ),
                 revoked=assignment.revoked,
-                managed_path=self._managed_link(),
-                version_dir=current.version_dir,
-                applied_at=_read_applied_at(current.version_dir),
+                managed_path=self._profile / _MANAGED_LINK_NAME,
+                version_dir=self._profile / _VERSIONS_DIR_NAME / version_key,
+                applied_at=applied_at,
             )
-
-        # 4-5. Materialize into staging and publish atomically.
-        version_key = self._version_key(assignment, content_key)
-        staging = self._versions_dir() / f".staging.{secrets.token_hex(8)}"
-        applied_at = (clock or _now_iso)()
-        try:
-            self._materialize(staging, assignment, content_key, version_key, applied_at)
-            self._publish(staging, version_key)
-        except Exception:
-            _silent_rmtree(staging)
-            raise
-
-        # 6. Ensure the enterprise tracking symlink exists.
-        self._ensure_enterprise_symlink()
-
-        # 7. Clean orphaned version directories.
-        self._cleanup_old_versions(keep=version_key)
-
-        version_dir = self._versions_dir() / version_key
-        return ApplyResult(
-            revision=assignment.revision,
-            version_id=assignment.version_id,
-            content_key=content_key,
-            status="revoked" if assignment.revoked else (
-                "initial" if current is None else "updated"
-            ),
-            revoked=assignment.revoked,
-            managed_path=self._managed_link(),
-            version_dir=version_dir,
-            applied_at=applied_at,
-        )
+        finally:
+            if skills_fd is not None:
+                os.close(skills_fd)
+            os.close(versions_fd)
+            os.close(profile_fd)
+            os.close(lock_fd)
 
     @classmethod
     def read_state(cls, profile_dir: Path) -> Optional[ManagedState]:
         """Return the currently applied managed state, or ``None`` if unmanaged."""
         applier = cls(profile_dir)
-        return applier._read_current()
+        return applier._read_state_locked()
 
     @classmethod
     def is_enabled(cls, profile_dir: Path) -> bool:
@@ -317,69 +580,109 @@ class ProfileApplier:
         state = cls.read_state(profile_dir)
         return state is not None and not state.revoked
 
-    # -- path helpers --
+    # -- locking & trusted dirs --
 
-    def _managed_link(self) -> Path:
-        return self._profile / _MANAGED_LINK_NAME
-
-    def _versions_dir(self) -> Path:
-        return self._profile / _VERSIONS_DIR_NAME
-
-    def _enterprise_link(self) -> Path:
-        return self._profile / _ENTERPRISE_LINK_REL
-
-    # -- pre-flight --
-
-    def _preflight_safety(self) -> None:
-        profile = self._profile.resolve()
+    def _open_and_lock(
+        self, *, exclusive: bool, timeout: float, sleep: Callable[[float], None]
+    ) -> tuple[int, int, int]:
         self._profile.mkdir(parents=True, exist_ok=True)
+        profile_fd = _open_dir_fd(self._profile)
+        try:
+            versions_fd = self._open_or_create_versions(profile_fd)
+            lock_fd = _open_lock_file(versions_fd)
+        except BaseException:
+            os.close(profile_fd)
+            raise
+        try:
+            self._flock(lock_fd, exclusive=exclusive, timeout=timeout, sleep=sleep)
+        except BaseException:
+            os.close(lock_fd)
+            os.close(versions_fd)
+            os.close(profile_fd)
+            raise
+        return profile_fd, versions_fd, lock_fd
 
-        versions = self._versions_dir()
-        if versions.is_symlink():
-            raise ProfileTamperError(".managed-versions must not be a symlink")
-        if versions.exists() and not versions.is_dir():
-            raise ProfileTamperError(".managed-versions must be a directory")
+    def _open_or_create_versions(self, profile_fd: int) -> int:
+        try:
+            return _open_dir_fd(_VERSIONS_DIR_NAME, dir_fd=profile_fd)
+        except FileNotFoundError:
+            try:
+                os.mkdir(_VERSIONS_DIR_NAME, dir_fd=profile_fd)
+                _fsync_dir_fd(profile_fd)
+            except FileExistsError:
+                pass  # another process created it concurrently
+            return _open_dir_fd_retry(_VERSIONS_DIR_NAME, dir_fd=profile_fd)
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise ProfileTamperError(
+                    ".managed-versions must not be a symlink"
+                ) from exc
+            raise
 
-        managed = self._managed_link()
-        if managed.is_symlink():
-            if not managed.exists():
-                raise ProfileTamperError("managed symlink is broken")
-            if not _is_within(managed.resolve(), profile):
-                raise ProfileTamperError("managed symlink resolves outside the profile")
-        elif managed.exists():
-            raise ProfileTamperError("managed must be a symlink, not a real directory")
+    def _open_skills_dir(self, profile_fd: int) -> int:
+        try:
+            return _open_or_create_subdir(profile_fd, "skills")
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise ProfileTamperError("skills must not be a symlink") from exc
+            raise
 
-        skills = self._profile / "skills"
-        if skills.is_symlink():
-            if not _is_within(skills.resolve(), profile):
-                raise ProfileTamperError("skills symlink resolves outside the profile")
-        elif skills.exists() and not skills.is_dir():
-            raise ProfileTamperError("skills must be a directory")
+    def _flock(
+        self, lock_fd: int, *, exclusive: bool, timeout: float, sleep: Callable[[float], None]
+    ) -> None:
+        op = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(lock_fd, op | fcntl.LOCK_NB)
+                return
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ProfileLockTimeoutError(
+                        f"could not acquire apply lock within {timeout}s"
+                    )
+                sleep(min(0.05, max(0.0, remaining)))
 
-        enterprise = self._enterprise_link()
-        if enterprise.is_symlink():
-            if not enterprise.exists():
-                raise ProfileTamperError("skills/enterprise symlink is broken")
-            if not _is_within(enterprise.resolve(), profile):
-                raise ProfileTamperError("skills/enterprise symlink resolves outside the profile")
-        elif enterprise.exists():
-            raise ProfileTamperError(
-                "skills/enterprise must be a symlink, not a real directory"
-            )
-
-    # -- current state --
-
-    def _read_current(self) -> Optional[ManagedState]:
-        managed = self._managed_link()
-        if not managed.is_symlink():
+    def _read_state_locked(self) -> Optional[ManagedState]:
+        if not (self._profile / _VERSIONS_DIR_NAME).exists():
             return None
-        if not managed.exists():
-            raise ProfileTamperError("managed symlink is broken")
-        version_dir = managed.resolve()
-        record_path = version_dir / "assignment.json"
-        if not record_path.exists():
+        profile_fd, versions_fd, lock_fd = self._open_and_lock(
+            exclusive=False, timeout=30.0, sleep=time.sleep
+        )
+        try:
+            return self._read_current(profile_fd, versions_fd)
+        finally:
+            os.close(versions_fd)
+            os.close(profile_fd)
+            os.close(lock_fd)
+
+    # -- current state (TOCTOU-safe: readlink + validate + open via versions_fd) --
+
+    def _read_current(self, profile_fd: int, versions_fd: int) -> Optional[ManagedState]:
+        try:
+            target = os.readlink(_MANAGED_LINK_NAME, dir_fd=profile_fd)
+        except FileNotFoundError:
             return None
-        record = json.loads(record_path.read_text())
+        except OSError as exc:
+            if exc.errno == errno.EINVAL:
+                raise ProfileTamperError(
+                    "managed must be a symlink, not a real directory"
+                ) from exc
+            raise
+
+        prefix = _VERSIONS_DIR_NAME + "/"
+        if not target.startswith(prefix):
+            raise ProfileTamperError("managed symlink target is unexpected")
+        version_key = target[len(prefix):]
+        if "/" in version_key or version_key.startswith("."):
+            raise ProfileTamperError("managed symlink target is unexpected")
+
+        try:
+            raw = _read_rel(versions_fd, f"{version_key}/assignment.json")
+        except FileNotFoundError:
+            return None
+        record = json.loads(raw)
         return ManagedState(
             assignment_id=record["assignment_id"],
             revision=record["revision"],
@@ -390,7 +693,8 @@ class ProfileApplier:
             content_key=record["content_key"],
             revoked=record["revoked"],
             revoked_at=record.get("revoked_at"),
-            version_dir=version_dir,
+            version_key=version_key,
+            version_dir=self._profile / _VERSIONS_DIR_NAME / version_key,
         )
 
     # -- revision semantics --
@@ -410,7 +714,6 @@ class ProfileApplier:
                 raise RevisionConflictError(
                     f"revision {assignment.revision} already applied with different content"
                 )
-        # assignment.revision > current.revision -> update / rollback, allowed.
 
     # -- content addressing --
 
@@ -438,60 +741,69 @@ class ProfileApplier:
 
     def _materialize(
         self,
-        staging: Path,
+        versions_fd: int,
         assignment: RuntimeAssignment,
         content_key: str,
         version_key: str,
         applied_at: str,
-    ) -> None:
-        staging.mkdir(parents=True, exist_ok=False)
-        policy = dict(assignment.effective_model_policy)
-        policy_sha = policy.get("policySha256", "")
-
-        record = {
-            "assignment_id": assignment.assignment_id,
-            "revision": assignment.revision,
-            "template_id": assignment.template_id,
-            "version_id": assignment.version_id,
-            "template_slug": assignment.template_slug,
-            "display_name": assignment.display_name,
-            "manifest_sha256": assignment.manifest_sha256,
-            "policy_sha256": policy_sha,
-            "content_key": content_key,
-            "version_key": version_key,
-            "revoked": assignment.revoked,
-            "revoked_at": assignment.revoked_at,
-            "applied_at": applied_at,
-        }
-
-        _write_file_atomic(staging / "assignment.json", canonical_json(record))
-        _write_file_atomic(staging / "manifest.json", canonical_json(dict(assignment.manifest)))
-        _write_file_atomic(staging / "policy.json", canonical_json(policy))
-
-        enterprise_dir = staging / "skills" / "enterprise"
-        enterprise_dir.mkdir(parents=True, exist_ok=True)
-
-        if assignment.revoked:
-            tombstone = {
-                "revoked": True,
-                "revoked_at": assignment.revoked_at,
+    ) -> str:
+        staging_name = f".staging.{secrets.token_hex(8)}"
+        os.mkdir(staging_name, dir_fd=versions_fd)
+        staging_fd = _open_dir_fd(staging_name, dir_fd=versions_fd)
+        try:
+            policy = dict(assignment.effective_model_policy)
+            policy_sha = policy.get("policySha256", "")
+            record = {
                 "assignment_id": assignment.assignment_id,
                 "revision": assignment.revision,
+                "template_id": assignment.template_id,
                 "version_id": assignment.version_id,
+                "template_slug": assignment.template_slug,
+                "display_name": assignment.display_name,
+                "manifest_sha256": assignment.manifest_sha256,
+                "policy_sha256": policy_sha,
+                "content_key": content_key,
+                "version_key": version_key,
+                "revoked": assignment.revoked,
+                "revoked_at": assignment.revoked_at,
+                "applied_at": applied_at,
             }
-            _write_file_atomic(staging / "tombstone.json", canonical_json(tombstone))
-        else:
-            self._materialize_enterprise_skills(assignment, enterprise_dir)
+            _write_rel(staging_fd, "assignment.json", canonical_json(record))
+            _write_rel(staging_fd, "manifest.json", canonical_json(dict(assignment.manifest)))
+            _write_rel(staging_fd, "policy.json", canonical_json(policy))
 
-        _fsync_dir(staging)
-        _fsync_dir(staging / "skills")
-        _fsync_dir(enterprise_dir)
+            # skills/enterprise/ always exists in the version dir so the
+            # tracking symlink is never dangling after the commit.
+            os.mkdir("skills", dir_fd=staging_fd)
+            skills_in_staging_fd = _open_dir_fd("skills", dir_fd=staging_fd)
+            try:
+                os.mkdir("enterprise", dir_fd=skills_in_staging_fd)
+                ent_fd = _open_dir_fd("enterprise", dir_fd=skills_in_staging_fd)
+                try:
+                    if assignment.revoked:
+                        tombstone = {
+                            "revoked": True,
+                            "revoked_at": assignment.revoked_at,
+                            "assignment_id": assignment.assignment_id,
+                            "revision": assignment.revision,
+                            "version_id": assignment.version_id,
+                        }
+                        _write_rel(staging_fd, "tombstone.json", canonical_json(tombstone))
+                    else:
+                        self._materialize_enterprise_skills(assignment, ent_fd)
+                finally:
+                    os.close(ent_fd)
+            finally:
+                os.close(skills_in_staging_fd)
 
-        # Verify the written bytes match the signed checksums.
-        self._verify_staging(staging, assignment)
+            _fsync_dir_fd(staging_fd)
+            self._verify_staging(staging_fd, assignment)
+        finally:
+            os.close(staging_fd)
+        return staging_name
 
     def _materialize_enterprise_skills(
-        self, assignment: RuntimeAssignment, enterprise_dir: Path
+        self, assignment: RuntimeAssignment, enterprise_fd: int
     ) -> None:
         manifest = assignment.manifest
         skills = manifest.get("enterpriseSkills", []) if isinstance(manifest, Mapping) else []
@@ -503,106 +815,195 @@ class ProfileApplier:
             if not isinstance(skill, Mapping):
                 raise ProfileStateError("each enterprise skill must be an object")
             slug = _validate_slug(skill.get("slug"))
-            skill_dir = enterprise_dir / slug
-            skill_dir.mkdir(parents=True, exist_ok=False)
+            _open_or_create_subdir(enterprise_fd, slug)
             files = skill.get("files", [])
             if not isinstance(files, list):
                 raise ProfileStateError("enterprise skill 'files' must be a list")
             for entry in files:
                 if not isinstance(entry, Mapping):
                     raise ProfileStateError("each enterprise skill file must be an object")
-                target = _safe_skill_file_path(entry.get("path"), skill_dir)
+                rel = _safe_skill_file_path(entry.get("path"))
                 content = entry.get("content")
                 if not isinstance(content, str):
                     raise ProfileStateError("enterprise skill file 'content' must be a string")
-                _write_file_atomic(target, content)
+                _write_rel(enterprise_fd, f"{slug}/{rel}", content)
 
-    def _verify_staging(self, staging: Path, assignment: RuntimeAssignment) -> None:
-        manifest_bytes = (staging / "manifest.json").read_bytes()
-        policy_bytes = (staging / "policy.json").read_bytes()
-        manifest_obj = json.loads(manifest_bytes)
-        policy_obj = json.loads(policy_bytes)
-        if sha256_hex(manifest_bytes) != sha256_hex(canonical_json_bytes(assignment.manifest)):
-            raise ChecksumMismatchError("staged manifest bytes do not match the signed digest")
-        # policySha256 is verified by verify_policy_checksum on the staged copy.
-        verify_policy_checksum(policy_obj)
-        # Confirm the manifest object round-trips to the signed digest.
+    def _verify_staging(self, staging_fd: int, assignment: RuntimeAssignment) -> None:
+        manifest_obj = json.loads(_read_rel(staging_fd, "manifest.json"))
+        policy_obj = json.loads(_read_rel(staging_fd, "policy.json"))
         verify_manifest_checksum(manifest_obj, assignment.manifest_sha256)
+        verify_policy_checksum(policy_obj)
 
-    # -- publish --
+    # -- publish helpers --
 
-    def _publish(self, staging: Path, version_key: str) -> None:
-        versions_dir = self._versions_dir()
-        versions_dir.mkdir(parents=True, exist_ok=True)
-        version_dir = versions_dir / version_key
-        if version_dir.exists():
+    def _rename_to_version(
+        self, versions_fd: int, staging_name: str, version_key: str
+    ) -> None:
+        try:
+            _lstat_rel(version_key, versions_fd)
             raise ProfileStateError(f"version directory already exists: {version_key}")
+        except FileNotFoundError:
+            pass
+        _atomic_replace(
+            staging_name, version_key, src_dir_fd=versions_fd, dst_dir_fd=versions_fd
+        )
+        _fsync_dir_fd(versions_fd)
 
-        # Atomic rename of the staging directory into its final name.
-        os.replace(staging, version_dir)
-        _fsync_dir(versions_dir)
+    def _prepare_enterprise_link(self, skills_fd: int) -> None:
+        """Ensure ``skills/enterprise`` tracks ``managed`` before the commit.
 
-        # Create a temporary symlink, then atomically swap it onto `managed`.
-        temp_link = self._profile / f".managed.swap.{secrets.token_hex(8)}"
-        relative_target = f"{_VERSIONS_DIR_NAME}/{version_key}"
+        First apply (link absent): create the tracking symlink (dangling until
+        the ``managed`` commit).  Updates (link present): verify it still has
+        the expected target — a tampered link fails closed instead of being
+        silently reclaimed.
+        """
         try:
-            os.symlink(relative_target, temp_link)
-        except OSError:
-            _silent_unlink(temp_link)
-            _silent_rmtree(version_dir)
-            raise
-        try:
-            _atomic_replace(temp_link, self._managed_link())
-        except OSError:
-            _silent_unlink(temp_link)
-            _silent_rmtree(version_dir)
-            raise
-        _fsync_dir(self._profile)
-
-    def _ensure_enterprise_symlink(self) -> None:
-        skills_dir = self._profile / "skills"
-        skills_dir.mkdir(parents=True, exist_ok=True)
-        enterprise = self._enterprise_link()
-        if enterprise.is_symlink():
-            # Already tracks `managed`; validated in pre-flight.
-            return
-        if enterprise.exists():
-            # Pre-flight would have raised for a real directory; be defensive.
-            raise ProfileTamperError("skills/enterprise must be a symlink, not a real directory")
-        os.symlink(_ENTERPRISE_LINK_TARGET, enterprise)
-        _fsync_dir(skills_dir)
-
-    def _cleanup_old_versions(self, *, keep: str) -> None:
-        versions_dir = self._versions_dir()
-        if not versions_dir.is_dir():
-            return
-        active = self._managed_link().resolve()
-        for entry in versions_dir.iterdir():
-            if entry.name == keep:
-                continue
-            if entry.name.startswith(".staging.") or entry.name.startswith(".managed.swap."):
-                _silent_rmtree(entry) if entry.is_dir() else _silent_unlink(entry)
-                continue
-            # Keep the directory that `managed` currently resolves to (it may
-            # differ from `keep` briefly during recovery); otherwise remove
-            # orphaned version dirs.
+            st = _lstat_rel(_ENTERPRISE_LINK_NAME, skills_fd)
+        except FileNotFoundError:
+            temp_name = f".enterprise.swap.{secrets.token_hex(8)}"
+            self._create_enterprise_symlink(skills_fd, temp_name)
             try:
-                if entry.resolve() == active:
-                    continue
+                _atomic_replace(
+                    temp_name, _ENTERPRISE_LINK_NAME,
+                    src_dir_fd=skills_fd, dst_dir_fd=skills_fd,
+                )
             except OSError:
+                _unlink_rel(temp_name, skills_fd)
+                raise
+            self._fsync_enterprise_parent(skills_fd)
+            return
+        if not stat.S_ISLNK(st.st_mode):
+            raise ProfileTamperError(
+                "skills/enterprise must be a symlink, not a real directory"
+            )
+        target = os.readlink(_ENTERPRISE_LINK_NAME, dir_fd=skills_fd)
+        if target != _ENTERPRISE_LINK_TARGET:
+            raise ProfileTamperError("skills/enterprise symlink target is unexpected")
+
+    def _create_enterprise_symlink(self, skills_fd: int, temp_name: str) -> None:
+        try:
+            _symlink_rel_fd(
+                _ENTERPRISE_LINK_TARGET, temp_name, skills_fd,
+                self._profile / "skills",
+            )
+        except FileExistsError:
+            # Stale swap entry from a previous crashed apply; clear and retry once.
+            _unlink_rel(temp_name, skills_fd)
+            _symlink_rel_fd(
+                _ENTERPRISE_LINK_TARGET, temp_name, skills_fd,
+                self._profile / "skills",
+            )
+
+    def _fsync_enterprise_parent(self, skills_fd: int) -> None:
+        _fsync_dir_fd(skills_fd)
+
+    def _verify_entries_unchanged(
+        self, profile_fd: int, versions_fd: int, skills_fd: int
+    ) -> None:
+        """Re-verify managed roots were not replaced (TOCTOU) right before commit."""
+        self._verify_dir_entry_pinned(profile_fd, _VERSIONS_DIR_NAME, versions_fd)
+        self._verify_dir_entry_pinned(profile_fd, "skills", skills_fd)
+        # managed, if present, must still be a symlink (not swapped to a real dir).
+        try:
+            st = _lstat_rel(_MANAGED_LINK_NAME, profile_fd)
+            if not stat.S_ISLNK(st.st_mode):
+                raise ProfileTamperError("managed must be a symlink, not a real directory")
+        except FileNotFoundError:
+            pass  # first apply — managed does not exist yet
+        # enterprise link, if present, must still track managed.
+        try:
+            est = _lstat_rel(_ENTERPRISE_LINK_NAME, skills_fd)
+            if not stat.S_ISLNK(est.st_mode):
+                raise ProfileTamperError(
+                    "skills/enterprise must be a symlink, not a real directory"
+                )
+            if os.readlink(_ENTERPRISE_LINK_NAME, dir_fd=skills_fd) != _ENTERPRISE_LINK_TARGET:
+                raise ProfileTamperError("skills/enterprise symlink target is unexpected")
+        except FileNotFoundError:
+            pass
+
+    @staticmethod
+    def _verify_dir_entry_pinned(parent_fd: int, name: str, held_fd: int) -> None:
+        st_entry = _lstat_rel(name, parent_fd)
+        if not stat.S_ISDIR(st_entry.st_mode):
+            raise ProfileTamperError(f"{name} was replaced with a non-directory")
+        st_held = os.fstat(held_fd)
+        if st_entry.st_ino != st_held.st_ino or st_entry.st_dev != st_held.st_dev:
+            raise ProfileTamperError(f"{name} directory was replaced mid-apply")
+
+    def _publish_managed(self, profile_fd: int, version_key: str) -> None:
+        temp_name = f".managed.swap.{secrets.token_hex(8)}"
+        target = f"{_VERSIONS_DIR_NAME}/{version_key}"
+        try:
+            _symlink_rel_fd(target, temp_name, profile_fd, self._profile)
+        except OSError:
+            _unlink_rel(temp_name, profile_fd)
+            raise
+        try:
+            _atomic_replace(
+                temp_name, _MANAGED_LINK_NAME,
+                src_dir_fd=profile_fd, dst_dir_fd=profile_fd,
+            )
+        except OSError:
+            _unlink_rel(temp_name, profile_fd)
+            raise
+        _fsync_dir_fd(profile_fd)
+
+    # -- rollback --
+
+    def _rollback(
+        self,
+        profile_fd: int,
+        versions_fd: int,
+        skills_fd: int,
+        version_key: str,
+        staging_name: Optional[str],
+        first_apply: bool,
+    ) -> None:
+        if staging_name is not None:
+            try:
+                _remove_entry(versions_fd, staging_name)
+            except FileNotFoundError:
                 pass
-            if entry.is_dir():
-                _silent_rmtree(entry)
+        # Remove the newly-created version dir (orphan; not yet active).
+        try:
+            _lstat_rel(version_key, versions_fd)
+            _remove_entry(versions_fd, version_key)
+        except FileNotFoundError:
+            pass
+        # On first apply the enterprise link is dangling; remove it so no
+        # half-baked active link survives.  On updates it tracks the still-active
+        # old managed symlink and must be left in place.
+        if first_apply:
+            try:
+                st = _lstat_rel(_ENTERPRISE_LINK_NAME, skills_fd)
+                if stat.S_ISLNK(st.st_mode):
+                    os.unlink(_ENTERPRISE_LINK_NAME, dir_fd=skills_fd)
+            except FileNotFoundError:
+                pass
+        _fsync_dir_fd(versions_fd)
+        _fsync_dir_fd(skills_fd)
 
+    # -- cleanup --
 
-def _read_applied_at(version_dir: Path) -> str:
-    try:
-        record = json.loads((version_dir / "assignment.json").read_text())
-        return record.get("applied_at", "")
-    except (FileNotFoundError, json.JSONDecodeError):
-        return ""
-
-
-def canonical_json(obj: Any) -> str:
-    """Canonical JSON text for managed-layer files (matches contracts.algorithm)."""
-    return canonical_json_bytes(obj).decode("utf-8")
+    def _cleanup_old_versions(self, versions_fd: int, *, keep: str) -> None:
+        for name in os.listdir(versions_fd):
+            if name == keep:
+                continue
+            if name == _LOCK_FILE_NAME:
+                continue
+            if name.startswith(".staging.") or name.startswith(".managed.swap.") \
+                    or name.startswith(".enterprise.swap."):
+                _remove_entry(versions_fd, name)
+                continue
+            # A version directory.  lstat (no follow); skip symlinks, never
+            # delete their target.
+            try:
+                st = _lstat_rel(name, versions_fd)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                # Planted symlink inside .managed-versions: do not follow, do not
+                # delete its target.  Leave it for forensic reporting.
+                continue
+            _remove_entry(versions_fd, name)

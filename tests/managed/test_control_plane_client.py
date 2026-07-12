@@ -34,14 +34,15 @@ def _assignment_payload(revision: int = 2, version_id: int = 19) -> dict:
         "note": MANIFEST_CANARY,
     }
     policy = {
+        # Golden vector 1 (framed checksum) — see test_contracts.GOLDEN_VECTORS.
         "mode": "ENTERPRISE_MANAGED",
         "allowedModels": ["enterprise/deepseek-chat"],
         "defaultModel": "enterprise/deepseek-chat",
         "fallbackModels": [],
         "localProviderAllowed": False,
-        "policyVersion": "v1",
+        "policyVersion": "sha256:5ea1e6720cc6",
+        "policySha256": "5ea1e6720cc6dc3ef2cae5579c687dd98d80245bdf3a2ca89fb70e85c876899a",
     }
-    policy["policySha256"] = sha256_hex(canonical_json_bytes(policy))
     return {
         "assignmentId": 20,
         "revision": revision,
@@ -260,6 +261,116 @@ class TestRetry:
             client.fetch_runtime_assignments()
         # backoff: 0.1, 0.2, 0.4
         assert sleeps == [0.1, 0.2, 0.4]
+
+    def test_retries_on_transport_error_then_succeeds(self):
+        # httpx.TransportError (e.g. ConnectError) is retryable, not just timeouts.
+        calls = {"n": 0}
+
+        def handler(request):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise httpx.ConnectError("simulated connection refused")
+            return _ok_response()
+
+        client = _make_client(handler, max_retries=3)
+        result = client.fetch_runtime_assignments()
+        assert calls["n"] == 2
+        assert result.status_code == 200
+
+    def test_gives_up_after_max_retries_on_transport_error(self):
+        calls = {"n": 0}
+
+        def handler(request):
+            calls["n"] += 1
+            raise httpx.ReadError("simulated read error")
+
+        client = _make_client(handler, max_retries=2)
+        with pytest.raises(TransientFailureError):
+            client.fetch_runtime_assignments()
+        assert calls["n"] == 3
+
+
+class TestRetryAfter:
+    def test_429_with_retry_after_retries_then_succeeds(self):
+        calls = {"n": 0}
+        sleeps = []
+
+        def handler(request):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return httpx.Response(429, headers={"Retry-After": "1"})
+            return _ok_response()
+
+        client = _make_client(handler, max_retries=3, sleep=lambda s: sleeps.append(s))
+        result = client.fetch_runtime_assignments()
+        assert calls["n"] == 2
+        assert result.status_code == 200
+        assert sleeps == [1.0]
+
+    def test_429_without_retry_after_does_not_retry(self):
+        calls = {"n": 0}
+
+        def handler(request):
+            calls["n"] += 1
+            return httpx.Response(429)
+
+        client = _make_client(handler, max_retries=3)
+        with pytest.raises(UnexpectedStatusError):
+            client.fetch_runtime_assignments()
+        assert calls["n"] == 1
+
+    def test_5xx_with_retry_after_honors_it(self):
+        calls = {"n": 0}
+        sleeps = []
+
+        def handler(request):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return httpx.Response(503, headers={"Retry-After": "0.5"})
+            return _ok_response()
+
+        client = _make_client(
+            handler, max_retries=3, sleep=lambda s: sleeps.append(s),
+            retry_base_delay=10.0,  # exponential would be 10s; RA must override
+        )
+        client.fetch_runtime_assignments()
+        assert calls["n"] == 2
+        assert sleeps == [0.5]  # Retry-After used, not exponential backoff
+
+    def test_retry_after_is_capped(self):
+        calls = {"n": 0}
+        sleeps = []
+
+        def handler(request):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return httpx.Response(503, headers={"Retry-After": "120"})
+            return _ok_response()
+
+        client = _make_client(
+            handler, max_retries=3, sleep=lambda s: sleeps.append(s),
+            retry_after_max=60.0,
+        )
+        client.fetch_runtime_assignments()
+        assert sleeps == [60.0]  # capped at retry_after_max
+
+    def test_http_date_retry_after_falls_back_to_backoff(self):
+        calls = {"n": 0}
+        sleeps = []
+
+        def handler(request):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return httpx.Response(503, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"})
+            return _ok_response()
+
+        client = _make_client(
+            handler, max_retries=3, sleep=lambda s: sleeps.append(s),
+            retry_base_delay=0.1, retry_backoff_factor=2.0,
+        )
+        client.fetch_runtime_assignments()
+        # HTTP-date not parsed → exponential backoff fallback.
+        assert sleeps == [0.1]
 
 
 class TestNoRetryOnAuthErrors:
