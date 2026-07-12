@@ -6,6 +6,7 @@ via pinned directory fds, and persistence ordering.
 """
 
 import dataclasses
+import errno
 import json
 import os
 import subprocess
@@ -26,6 +27,7 @@ from hermes_managed.profile_applier import (
     ApplyResult,
     PathTraversalError,
     ProfileApplier,
+    ProfileDurabilityUncertainError,
     ProfileLockTimeoutError,
     ProfileRollbackError,
     ProfileStateError,
@@ -411,7 +413,7 @@ class TestAtomicity:
         def boom(*a, **k):
             raise OSError("simulated managed replace failure")
 
-        monkeypatch.setattr(applier, "_publish_managed", boom)
+        monkeypatch.setattr(applier, "_commit_managed_link", boom)
         with pytest.raises(OSError):
             applier.apply(runtime_assignment(revision=3, version_id=20))
         _assert_old_state_intact(profile, 2, paths)
@@ -503,7 +505,7 @@ class TestFaultInjection:
         def boom(*a, **k):
             raise OSError("managed atomic replace failure")
 
-        monkeypatch.setattr(applier, "_publish_managed", boom)
+        monkeypatch.setattr(applier, "_commit_managed_link", boom)
         with pytest.raises(OSError):
             applier.apply(runtime_assignment(revision=3, version_id=20))
         _assert_old_state_intact(profile, 2, paths)
@@ -532,13 +534,115 @@ class TestFaultInjection:
         def rollback_boom(*a, **k):
             raise OSError("rollback failure")
 
-        monkeypatch.setattr(applier, "_publish_managed", publish_boom)
+        monkeypatch.setattr(applier, "_commit_managed_link", publish_boom)
         monkeypatch.setattr(applier, "_rollback", rollback_boom)
         with pytest.raises(ProfileRollbackError):
             applier.apply(runtime_assignment(revision=3, version_id=20))
         # managed was never swapped -> old state still active.
         assert _read_assignment_json(profile)["revision"] == 2
         _assert_personal_preserved(profile, paths)
+
+
+# --- post-commit durability failure (commit/durability split) ----------------
+
+
+class TestDurabilityFailure:
+    """A post-commit fsync failure must NOT roll back the committed active state.
+
+    The commit (managed symlink swap) and the durability sync (profile dir
+    fsync) are separate: once the swap succeeds the new revision is active, so a
+    subsequent fsync EIO is reported as ProfileDurabilityUncertainError without
+    deleting the new version dir or restoring the old managed link.
+    """
+
+    def test_initial_apply_post_commit_fsync_eio(self, tmp_path, monkeypatch):
+        profile = tmp_path / "profile"
+        paths = _seed_personal_content(profile)
+        applier = ProfileApplier(profile)
+
+        def boom(profile_fd):
+            raise OSError(errno.EIO, "simulated profile dir fsync EIO")
+
+        monkeypatch.setattr(applier, "_fsync_profile_dir", boom)
+        with pytest.raises(ProfileDurabilityUncertainError):
+            applier.apply(runtime_assignment(revision=2, version_id=19))
+        # The new revision IS active: managed not dangling, version_dir present,
+        # assignment.json readable at the new revision.
+        managed = profile / "managed"
+        assert managed.is_symlink()
+        assert (managed.resolve() / "assignment.json").exists()
+        assert _read_assignment_json(profile)["revision"] == 2
+        # enterprise link still tracks managed.
+        assert (profile / "skills" / "enterprise").is_symlink()
+        _assert_personal_preserved(profile, paths)
+
+    def test_update_post_commit_fsync_eio_preserves_new_and_idempotent_retry(
+        self, tmp_path, monkeypatch
+    ):
+        profile = tmp_path / "profile"
+        applier = ProfileApplier(profile)
+        applier.apply(runtime_assignment(revision=2, version_id=19))
+        rev2_key = _active_version_key(profile)
+
+        def boom(profile_fd):
+            raise OSError(errno.EIO, "simulated profile dir fsync EIO")
+
+        monkeypatch.setattr(applier, "_fsync_profile_dir", boom)
+        with pytest.raises(ProfileDurabilityUncertainError):
+            applier.apply(runtime_assignment(revision=3, version_id=20))
+        # managed points to rev3 (not dangling); rev3 version_dir preserved.
+        managed = profile / "managed"
+        assert managed.is_symlink()
+        assert _read_assignment_json(profile)["revision"] == 3
+        # rev2 NOT deleted: no cleanup runs in the durability-uncertain path.
+        assert (profile / ".managed-versions" / rev2_key / "assignment.json").exists()
+        # Retrying the same revision/content is safe and idempotent.
+        result = ProfileApplier(profile).apply(runtime_assignment(revision=3, version_id=20))
+        assert result.status == "idempotent"
+        assert result.revision == 3
+
+    def test_pre_commit_replace_failure_calls_rollback(self, tmp_path, monkeypatch):
+        profile = tmp_path / "profile"
+        paths = _seed_personal_content(profile)
+        applier = ProfileApplier(profile)
+        applier.apply(runtime_assignment(revision=2, version_id=19))
+
+        rollback_calls = []
+
+        def rollback_spy(*a, **k):
+            rollback_calls.append(True)
+
+        def commit_boom(*a, **k):
+            raise OSError("commit replace failed")
+
+        monkeypatch.setattr(applier, "_rollback", rollback_spy)
+        monkeypatch.setattr(applier, "_commit_managed_link", commit_boom)
+        with pytest.raises(OSError):
+            applier.apply(runtime_assignment(revision=3, version_id=20))
+        # Pre-commit failure DOES roll back and preserves the old active state.
+        assert len(rollback_calls) == 1
+        _assert_old_state_intact(profile, 2, paths)
+
+    def test_post_commit_fsync_failure_never_calls_rollback(self, tmp_path, monkeypatch):
+        profile = tmp_path / "profile"
+        applier = ProfileApplier(profile)
+        applier.apply(runtime_assignment(revision=2, version_id=19))
+
+        rollback_calls = []
+
+        def rollback_spy(*a, **k):
+            rollback_calls.append(True)
+
+        def fsync_boom(profile_fd):
+            raise OSError(errno.EIO, "simulated profile dir fsync EIO")
+
+        monkeypatch.setattr(applier, "_rollback", rollback_spy)
+        monkeypatch.setattr(applier, "_fsync_profile_dir", fsync_boom)
+        with pytest.raises(ProfileDurabilityUncertainError):
+            applier.apply(runtime_assignment(revision=3, version_id=20))
+        # The committed new state must NOT be rolled back.
+        assert rollback_calls == []
+        assert _read_assignment_json(profile)["revision"] == 3
 
 
 # --- cross-process concurrency (section 3) -----------------------------------
@@ -841,6 +945,97 @@ class TestPersistence:
         monkeypatch.setattr(applier, "_fsync_enterprise_parent", spy)
         applier.apply(runtime_assignment(revision=2, version_id=19))
         assert called  # fsync seam exercised
+
+
+# --- FD ownership / leak regression ------------------------------------------
+
+
+class TestFdLeak:
+    """Every directory fd opened by the applier must be closed by the applier.
+
+    Wraps the fd-returning helpers (and os.close) to record opens vs closes and
+    asserts no fd is leaked across many revisions with many enterprise skills.
+    """
+
+    @staticmethod
+    def _install_trackers(monkeypatch):
+        import hermes_managed.profile_applier as pa
+
+        opened, closed = set(), set()
+        real_open_dir = pa._open_dir_fd
+        real_subdir = pa._open_or_create_subdir
+        real_lock = pa._open_lock_file
+        real_close = os.close
+
+        def w_open_dir(*a, **k):
+            fd = real_open_dir(*a, **k)
+            opened.add(fd)
+            return fd
+
+        def w_subdir(*a, **k):
+            fd = real_subdir(*a, **k)
+            opened.add(fd)
+            return fd
+
+        def w_lock(*a, **k):
+            fd = real_lock(*a, **k)
+            opened.add(fd)
+            return fd
+
+        def w_close(fd):
+            closed.add(fd)
+            real_close(fd)
+
+        monkeypatch.setattr(pa, "_open_dir_fd", w_open_dir)
+        monkeypatch.setattr(pa, "_open_or_create_subdir", w_subdir)
+        monkeypatch.setattr(pa, "_open_lock_file", w_lock)
+        monkeypatch.setattr(os, "close", w_close)
+        return opened, closed
+
+    def test_no_fd_leak_across_revisions_and_skills(self, tmp_path, monkeypatch):
+        opened, closed = self._install_trackers(monkeypatch)
+        profile = tmp_path / "profile"
+        applier = ProfileApplier(profile)
+        skills = [
+            {
+                "slug": f"skill-{i}",
+                "files": [
+                    {"path": "SKILL.md", "content": f"s{i}"},
+                    {"path": f"sub/run-{i}.py", "content": "print(1)"},
+                ],
+            }
+            for i in range(3)
+        ]
+        for rev in range(1, 6):  # 5 revisions, 3 multi-file skills each
+            applier.apply(runtime_assignment(revision=rev, version_id=10 + rev, skills=skills))
+        leaked = opened - closed
+        assert not leaked, f"leaked fds: {leaked}"
+
+    def test_no_fd_leak_on_revoked_apply(self, tmp_path, monkeypatch):
+        opened, closed = self._install_trackers(monkeypatch)
+        profile = tmp_path / "profile"
+        applier = ProfileApplier(profile)
+        applier.apply(runtime_assignment(revision=1, version_id=19))
+        applier.apply(
+            runtime_assignment(revision=2, version_id=19, revoked=True, revoked_at="2026-07-12T10:00:00Z")
+        )
+        leaked = opened - closed
+        assert not leaked, f"leaked fds: {leaked}"
+
+    def test_fd_count_does_not_grow_across_many_applies(self, tmp_path):
+        # Cross-check via /dev/fd (works on macOS and Linux): no fd growth.
+        profile = tmp_path / "profile"
+        applier = ProfileApplier(profile)
+        skills = [
+            {"slug": f"s{i}", "files": [{"path": "SKILL.md", "content": "x"}]} for i in range(4)
+        ]
+        applier.apply(runtime_assignment(revision=1, version_id=11, skills=skills))
+        before = len(os.listdir("/dev/fd"))
+        for rev in range(2, 12):  # 10 more applies
+            applier.apply(runtime_assignment(revision=rev, version_id=10 + rev, skills=skills))
+        after = len(os.listdir("/dev/fd"))
+        # No sustained growth (allow a tiny transient slack).
+        assert after <= before + 1, f"fd count grew: before={before} after={after}"
 
 
 # --- security / path traversal ----------------------------------------------

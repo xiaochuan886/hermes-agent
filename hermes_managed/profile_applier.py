@@ -101,6 +101,7 @@ __all__ = [
     "RevisionConflictError",
     "ProfileLockTimeoutError",
     "ProfileRollbackError",
+    "ProfileDurabilityUncertainError",
     "ManagedState",
     "ApplyResult",
     "ProfileApplier",
@@ -150,6 +151,17 @@ class ProfileLockTimeoutError(ProfileStateError):
 
 class ProfileRollbackError(ProfileStateError):
     """Rollback after a failed commit itself failed (state left for inspection)."""
+
+
+class ProfileDurabilityUncertainError(ProfileStateError):
+    """The new managed state was published but a post-commit durability sync
+    (directory fsync) failed.
+
+    The new revision IS active — ``managed`` already points at the new version
+    directory.  This error explicitly does NOT claim the previous state is still
+    valid.  The caller MUST NOT treat this as "old state preserved"; retrying the
+    same revision/content is safe and idempotent (the new version dir is intact).
+    """
 
 
 # --- state records ------------------------------------------------------------
@@ -524,26 +536,42 @@ class ProfileApplier:
                 self._verify_entries_unchanged(profile_fd, versions_fd, skills_fd)
                 if self._pre_commit_hook is not None:
                     self._pre_commit_hook()
-                self._publish_managed(profile_fd, version_key)
+                # Commit point: atomically swap the managed symlink.  Nothing
+                # fallible may run between this succeeding and ``committed=True``.
+                self._commit_managed_link(profile_fd, version_key)
                 committed = True
-            except BaseException:
-                # Rollback every preparatory side effect; fail closed on the
-                # commit point.  A rollback failure is surfaced explicitly.
-                rollback_error: Optional[BaseException] = None
-                try:
-                    self._rollback(
-                        profile_fd, versions_fd, skills_fd, version_key,
-                        staging_name, first_apply,
-                    )
-                except Exception as exc:
-                    rollback_error = exc
-                if rollback_error is not None:
-                    raise ProfileRollbackError(
-                        "rollback failed after a failed commit"
-                    ) from rollback_error
-                raise
+                # Post-commit durability sync.  If this fails the new state is
+                # already published — it MUST NOT be rolled back.
+                self._fsync_profile_dir(profile_fd)
+            except BaseException as exc:
+                if not committed:
+                    # Pre-commit failure: rollback preparatory side effects and
+                    # preserve the previous active state.
+                    rollback_error: Optional[BaseException] = None
+                    try:
+                        self._rollback(
+                            profile_fd, versions_fd, skills_fd, version_key,
+                            staging_name, first_apply,
+                        )
+                    except Exception as rerr:
+                        rollback_error = rerr
+                    if rollback_error is not None:
+                        raise ProfileRollbackError(
+                            "rollback failed after a failed commit"
+                        ) from rollback_error
+                    raise
+                # committed == True: post-commit durability failure.  The new
+                # revision is already active — do NOT rollback (that would
+                # delete the active version dir) and do NOT run cleanup.  Surface
+                # as durability-uncertain; retrying the same revision is safe
+                # and idempotent because the new version dir is intact.
+                raise ProfileDurabilityUncertainError(
+                    "new managed state was published but profile directory "
+                    "durability could not be confirmed; the new revision is active"
+                ) from exc
 
             # Post-commit best-effort cleanup.  Its failure must NOT fail apply.
+            # Only reached when the durability sync succeeded.
             try:
                 self._cleanup_old_versions(versions_fd, keep=version_key)
             except Exception:
@@ -815,7 +843,12 @@ class ProfileApplier:
             if not isinstance(skill, Mapping):
                 raise ProfileStateError("each enterprise skill must be an object")
             slug = _validate_slug(skill.get("slug"))
-            _open_or_create_subdir(enterprise_fd, slug)
+            # Ensure the skill directory exists (even when it has no files).
+            # The returned fd is closed immediately — ownership: opener closes.
+            # (_write_rel below re-opens/creates the dir as needed and closes
+            # its own fd.)
+            slug_fd = _open_or_create_subdir(enterprise_fd, slug)
+            os.close(slug_fd)
             files = skill.get("files", [])
             if not isinstance(files, list):
                 raise ProfileStateError("enterprise skill 'files' must be a list")
@@ -931,7 +964,17 @@ class ProfileApplier:
         if st_entry.st_ino != st_held.st_ino or st_entry.st_dev != st_held.st_dev:
             raise ProfileTamperError(f"{name} directory was replaced mid-apply")
 
-    def _publish_managed(self, profile_fd: int, version_key: str) -> None:
+    def _commit_managed_link(self, profile_fd: int, version_key: str) -> None:
+        """Atomically publish the ``managed`` symlink (the commit point).
+
+        Creates a temp symlink and ``os.replace``s it over ``managed``.  This is
+        the ONLY commit point: once ``os.replace`` returns, the new version is
+        active.  No fallible operation (not even fsync) may run between the
+        replace succeeding and the caller recording ``committed=True``; the
+        post-commit durability fsync is performed separately by
+        :meth:`_fsync_profile_dir` so its failure can never trigger a rollback
+        that deletes the now-active version directory.
+        """
         temp_name = f".managed.swap.{secrets.token_hex(8)}"
         target = f"{_VERSIONS_DIR_NAME}/{version_key}"
         try:
@@ -947,6 +990,15 @@ class ProfileApplier:
         except OSError:
             _unlink_rel(temp_name, profile_fd)
             raise
+
+    def _fsync_profile_dir(self, profile_fd: int) -> None:
+        """Post-commit durability sync of the profile directory.
+
+        Surfaces genuine fsync errors (e.g. EIO) so they can be reported as
+        :class:`ProfileDurabilityUncertainError` without rolling back the
+        committed state.  macOS ``EINVAL`` (fsync on a dir fd unsupported) is
+        tolerated as before.
+        """
         _fsync_dir_fd(profile_fd)
 
     # -- rollback --

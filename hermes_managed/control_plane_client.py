@@ -21,9 +21,10 @@ manifest), and any provider credentials are never logged.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 
@@ -44,6 +45,20 @@ __all__ = [
 _LOGGER = logging.getLogger("hermes_managed.control_plane")
 
 _AGENT_RUNTIME_PATH = "/api/v1/me/agent-runtime"
+
+
+def _check_finite_nonneg(name: str, value: Any) -> None:
+    """Validate a numeric configuration that feeds ``sleep``.
+
+    Must be a real (non-bool) number, finite, and non-negative so the client
+    never sleeps for a negative, NaN, or infinite duration.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number")
+    if math.isnan(value) or math.isinf(value):
+        raise ValueError(f"{name} must be finite")
+    if value < 0:
+        raise ValueError(f"{name} must be >= 0")
 
 
 # --- exceptions ---------------------------------------------------------------
@@ -109,6 +124,10 @@ class ControlPlaneClient:
             raise ValueError("device_id must be a non-empty string")
         if max_retries < 0:
             raise ValueError("max_retries must be >= 0")
+        # Durations feed sleep() and must never be negative, NaN, or infinite.
+        _check_finite_nonneg("retry_base_delay", retry_base_delay)
+        _check_finite_nonneg("retry_backoff_factor", retry_backoff_factor)
+        _check_finite_nonneg("retry_after_max", retry_after_max)
 
         self._base_url = base_url.rstrip("/")
         self._token = token
@@ -224,9 +243,12 @@ class ControlPlaneClient:
     def _parse_retry_after(self, response: httpx.Response) -> Optional[float]:
         """Return a capped sleep duration (seconds) from a ``Retry-After`` header.
 
-        Only the integer-seconds form is honored; an HTTP-date value (or a
-        missing header) returns ``None`` so the caller falls back to exponential
-        backoff.  The duration is capped at ``retry_after_max``.
+        Honors the RFC 7231 delta-seconds form as a non-negative finite float
+        (integers and decimal seconds are both accepted).  An HTTP-date value, a
+        missing header, or a nonsensical value (negative / NaN / infinity)
+        returns ``None`` so the caller falls back to exponential backoff and
+        ``sleep`` is never called with a negative or non-finite duration.  The
+        duration is capped at ``retry_after_max``.
         """
         value = response.headers.get("Retry-After")
         if not value:
@@ -235,7 +257,7 @@ class ControlPlaneClient:
             seconds = float(value)
         except (TypeError, ValueError):
             return None
-        if seconds < 0:
+        if math.isnan(seconds) or math.isinf(seconds) or seconds < 0:
             return None
         return min(seconds, self._retry_after_max)
 

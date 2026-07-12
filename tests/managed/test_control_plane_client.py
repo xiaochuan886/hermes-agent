@@ -373,6 +373,89 @@ class TestRetryAfter:
         assert sleeps == [0.1]
 
 
+class TestRetryAfterBoundary:
+    """retry_after_max and the parsed header must never yield a negative,
+    NaN, or infinite sleep duration."""
+
+    @staticmethod
+    def _client(**kw):
+        return ControlPlaneClient(
+            base_url="https://cp.example.com", token=TOKEN, device_id="device-001",
+            http_client=httpx.Client(transport=httpx.MockTransport(lambda r: _ok_response())),
+            **kw,
+        )
+
+    @pytest.mark.parametrize("bad", [-1, -0.5, float("nan"), float("inf"), float("-inf")])
+    def test_invalid_retry_after_max_rejected(self, bad):
+        with pytest.raises(ValueError):
+            self._client(retry_after_max=bad)
+
+    @pytest.mark.parametrize("bad", [-1, float("nan"), float("inf")])
+    def test_invalid_retry_base_delay_rejected(self, bad):
+        with pytest.raises(ValueError):
+            self._client(retry_base_delay=bad)
+
+    def test_bool_retry_after_max_rejected(self):
+        # bool is a subclass of int; a JSON true/false is not a valid duration.
+        with pytest.raises(ValueError):
+            self._client(retry_after_max=True)
+
+    def test_retry_after_max_zero_allowed(self):
+        # 0 is a valid (non-negative, finite) configuration.
+        client = self._client(retry_after_max=0.0)
+        assert client._retry_after_max == 0.0
+
+    def test_negative_retry_after_header_falls_back_to_backoff(self):
+        # A negative Retry-After must not be passed to sleep; fall back instead.
+        calls = {"n": 0}
+        sleeps = []
+
+        def handler(request):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return httpx.Response(503, headers={"Retry-After": "-5"})
+            return _ok_response()
+
+        client = _make_client(
+            handler, max_retries=3, sleep=lambda s: sleeps.append(s),
+            retry_base_delay=0.1, retry_backoff_factor=2.0,
+        )
+        client.fetch_runtime_assignments()
+        assert all(s >= 0 for s in sleeps)
+        assert sleeps == [0.1]  # exponential fallback, not the negative header
+
+    def test_nan_retry_after_header_falls_back_to_backoff(self):
+        calls = {"n": 0}
+        sleeps = []
+
+        def handler(request):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return httpx.Response(503, headers={"Retry-After": "nan"})
+            return _ok_response()
+
+        client = _make_client(handler, max_retries=3, sleep=lambda s: sleeps.append(s))
+        client.fetch_runtime_assignments()
+        assert all(s >= 0 for s in sleeps)
+
+    def test_retry_after_capped_does_not_exceed_max(self):
+        calls = {"n": 0}
+        sleeps = []
+
+        def handler(request):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return httpx.Response(503, headers={"Retry-After": "999999"})
+            return _ok_response()
+
+        client = _make_client(
+            handler, max_retries=3, sleep=lambda s: sleeps.append(s),
+            retry_after_max=5.0,
+        )
+        client.fetch_runtime_assignments()
+        assert sleeps == [5.0]
+
+
 class TestNoRetryOnAuthErrors:
     def test_401_raises_auth_error_without_retry(self):
         calls = {"n": 0}
